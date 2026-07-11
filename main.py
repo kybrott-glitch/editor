@@ -70,6 +70,7 @@ class S(StatesGroup):
     logo_c1 = State()
     logo_c2 = State()
     scale = State()
+    pack_kind = State()
 
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
@@ -80,10 +81,15 @@ def skip_kb(callback_data: str) -> InlineKeyboardMarkup:
     )
 
 
-def scale_kb() -> InlineKeyboardMarkup:
-    """Returns the size-adjustment keyboard for the scale step."""
+def scale_kb(page: int, total: int) -> InlineKeyboardMarkup:
+    """Returns the preview keyboard: page nav (browse selected stickers) + size adjust + done."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [
+                InlineKeyboardButton(text="◀️", callback_data="page_prev"),
+                InlineKeyboardButton(text=f"{page + 1}/{total}", callback_data="noop"),
+                InlineKeyboardButton(text="▶️", callback_data="page_next"),
+            ],
             [
                 InlineKeyboardButton(text="+10", callback_data="scale_+10"),
                 InlineKeyboardButton(text="+5", callback_data="scale_+5"),
@@ -93,6 +99,18 @@ def scale_kb() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="✅ Done", callback_data="scale_done"),
             ],
+        ]
+    )
+
+
+def pack_kind_kb() -> InlineKeyboardMarkup:
+    """Returns the keyboard for choosing the final output type."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🙂 Custom Emoji Pack", callback_data="kind_emoji"),
+                InlineKeyboardButton(text="🎨 Sticker Pack", callback_data="kind_sticker"),
+            ]
         ]
     )
 
@@ -414,6 +432,18 @@ def get_001() -> dict | None:
         return json.load(f)
 
 
+def get_by_number(n: int) -> dict | None:
+    """Loads a specific base animation by its numeric index (e.g. 103 -> lotties/103.json)."""
+    for fp in LOTTIES_DIR.glob("*.json"):
+        try:
+            if int(fp.stem) == n:
+                with open(fp, encoding="utf-8") as f:
+                    return json.load(f)
+        except ValueError:
+            continue
+    return None
+
+
 def main_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -574,9 +604,33 @@ async def skip_logo_c2(call: CallbackQuery, state: FSMContext):
             None, lambda: make_text_layers(d["user_text"], c)
         )
         await state.update_data(layers=d["layers"])
-    await state.update_data(scale=100.0)
+    await state.update_data(scale=100.0, preview_idx=0)
     await send_preview(call.message, state)
     await state.set_state(S.scale)
+
+
+# ── Page navigation callbacks ─────────────────────────────────────────────────
+@dp.callback_query(S.scale, F.data == "noop")
+async def page_noop(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ALLOWED_USER:
+        return
+    await call.answer()
+
+
+@dp.callback_query(S.scale, F.data.in_(["page_prev", "page_next"]))
+async def page_nav(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ALLOWED_USER:
+        return
+    await call.answer()
+    d = await state.get_data()
+    selected = sorted(d.get("selected", []))
+    idx = d.get("preview_idx", 0)
+    if call.data == "page_prev":
+        idx = max(0, idx - 1)
+    else:
+        idx = min(len(selected) - 1, idx + 1)
+    await state.update_data(preview_idx=idx)
+    await send_preview(call.message, state)
 
 
 # ── Scale callbacks ───────────────────────────────────────────────────────────
@@ -588,10 +642,10 @@ async def scale_button(call: CallbackQuery, state: FSMContext):
     action = call.data[len("scale_") :]
     if action == "done":
         await call.message.edit_reply_markup(reply_markup=None)
-        d = await state.get_data()
-        await state.clear()
-        # Pass real user id explicitly — call.message.from_user would be the bot
-        await run_pack(call.message, d, uid=call.from_user.id)
+        await call.message.answer(
+            "📦 How should this pack be created?", reply_markup=pack_kind_kb()
+        )
+        await state.set_state(S.pack_kind)
         return
     d = await state.get_data()
     cur = d.get("scale", 100.0)
@@ -761,16 +815,22 @@ async def got_logo_c2(msg: Message, state: FSMContext):
             None, lambda: make_text_layers(d["user_text"], c)
         )
         await state.update_data(layers=d["layers"])
-    await state.update_data(scale=100.0)
+    await state.update_data(scale=100.0, preview_idx=0)
     await send_preview(msg, state)
     await state.set_state(S.scale)
 
 
 async def send_preview(msg: Message, state: FSMContext):
     d = await state.get_data()
-    anim = get_001()
+    selected = sorted(d.get("selected", []))
+    if not selected:
+        await msg.answer("❌ No stickers selected!")
+        return
+    idx = max(0, min(d.get("preview_idx", 0), len(selected) - 1))
+    n = selected[idx]
+    anim = get_by_number(n)
     if not anim:
-        await msg.answer("❌ lotties/ is empty!")
+        await msg.answer(f"❌ lotties/{n}.json not found!")
         return
     mod = build_anim(
         anim,
@@ -781,7 +841,7 @@ async def send_preview(msg: Message, state: FSMContext):
         d.get("ff_color"),
         d.get("logo_c1"),
         d.get("logo_c2"),
-        1,
+        n,
     )
     status = await msg.answer("🎞 Rendering preview GIF…")
     try:
@@ -793,10 +853,16 @@ async def send_preview(msg: Message, state: FSMContext):
         await status.edit_text(f"❌ Preview render failed: {type(e).__name__}: {e}")
         return
     await status.delete()
+    await state.update_data(preview_idx=idx)
     await msg.answer_animation(
         BufferedInputFile(gif_bytes, filename="preview.gif"),
-        caption=f"👀 Preview — Scale: {d['scale']}%\nUse the buttons to adjust size, or type a value (+5, -10, 75…)\nPress ✅ Done when ready.",
-        reply_markup=scale_kb(),
+        caption=(
+            f"👀 Sticker #{n} — Scale: {d.get('scale', 100.0)}%\n"
+            f"◀️ ▶️ to browse your selected stickers and check the fit on each one\n"
+            f"Use the buttons to adjust size, or type a value (+5, -10, 75…)\n"
+            f"Press ✅ Done when ready."
+        ),
+        reply_markup=scale_kb(idx, len(selected)),
     )
 
 
@@ -806,9 +872,8 @@ async def scale_input(msg: Message, state: FSMContext):
         return
     t = msg.text.strip()
     if t.upper() == "DONE":
-        d = await state.get_data()
-        await state.clear()
-        await run_pack(msg, d)
+        await msg.answer("📦 How should this pack be created?", reply_markup=pack_kind_kb())
+        await state.set_state(S.pack_kind)
         return
     d = await state.get_data()
     cur = d.get("scale", 100.0)
@@ -825,7 +890,23 @@ async def scale_input(msg: Message, state: FSMContext):
     await send_preview(msg, state)
 
 
-async def run_pack(msg: Message, d: dict, uid: int | None = None):
+# ── Pack-kind callbacks ────────────────────────────────────────────────────────
+@dp.callback_query(S.pack_kind, F.data.in_(["kind_emoji", "kind_sticker"]))
+async def pack_kind_chosen(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ALLOWED_USER:
+        return
+    await call.answer()
+    await call.message.edit_reply_markup(reply_markup=None)
+    sticker_type = "custom_emoji" if call.data == "kind_emoji" else "regular"
+    d = await state.get_data()
+    await state.clear()
+    # Pass real user id explicitly — call.message.from_user would be the bot
+    await run_pack(call.message, d, uid=call.from_user.id, sticker_type=sticker_type)
+
+
+async def run_pack(
+    msg: Message, d: dict, uid: int | None = None, sticker_type: str = "custom_emoji"
+):
     import traceback
 
     # uid may be passed explicitly when msg is a bot-sent message (callback context)
@@ -891,7 +972,7 @@ async def run_pack(msg: Message, d: dict, uid: int | None = None):
                     name=name,
                     title=f"Pack {name[:5]}",
                     stickers=[sd],
-                    sticker_type="custom_emoji",
+                    sticker_type=sticker_type,
                 )
                 created = True
             else:
@@ -910,10 +991,12 @@ async def run_pack(msg: Message, d: dict, uid: int | None = None):
                     f"❌ Failed on first sticker:\n<code>{short}</code>", parse_mode="HTML"
                 )
                 return
+    link_path = "addemoji" if sticker_type == "custom_emoji" else "addstickers"
+    kind_label = "custom emoji" if sticker_type == "custom_emoji" else "stickers"
     if created:
         await stat.edit_text(
-            f"✅ Done! ({ok}/{len(files)} stickers)\n"
-            f"🔗 <a href='https://t.me/addemoji/{name}'>t.me/addemoji/{name}</a>"
+            f"✅ Done! ({ok}/{len(files)} {kind_label})\n"
+            f"🔗 <a href='https://t.me/{link_path}/{name}'>t.me/{link_path}/{name}</a>"
             + (f"\n⚠️ {len(files)-ok} failed — check logs" if ok < len(files) else ""),
             parse_mode="HTML",
         )

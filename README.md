@@ -13,10 +13,15 @@ before committing, then bulk-creates a full custom emoji/sticker pack.
 - **Live GIF preview**: renders a real animated GIF preview before you commit, with
   no sticker-format constraints (size, fps, file size) getting in the way while you
   check how it looks
+- **Paged preview across all selected stickers**: browse ◀️ ▶️ through every base
+  animation you selected before committing, so you can catch a logo that fits
+  well on one sticker but not another
 - **Adjustable scale**: nudge the logo size up/down with buttons or type a value,
   re-preview instantly
+- **Two output types**: build either a Custom Emoji pack or a regular Sticker pack
+  from the same selection
 - **Bulk pack creation**: processes every selected base animation and builds one
-  Telegram custom emoji sticker set in one go
+  Telegram sticker set in one go
 - **Single-user locked**: only responds to the Telegram user ID set in `ALLOWED_USER`
 
 ## Setup
@@ -91,11 +96,16 @@ Runs via long polling — no webhook/HTTPS setup needed. Recommended to run unde
 5. Send your logo file / text / SVG
 6. Enter/skip the two logo colors (used depending on whether the base animation has
    the special brand colors or not)
-7. **Preview**: you'll get an animated GIF. Use the +10/+5/-5/-10 buttons or type a
-   value (e.g. `+8`, `-3`, `75`) to resize, and it re-renders each time
-8. Tap **✅ Done** (or type `DONE`) when it looks right — the bot then builds the
-   full pack across every selected base animation and gives you the
-   `t.me/addemoji/...` link when finished
+7. **Preview**: you'll get an animated GIF of the first selected sticker.
+   - ◀️ / ▶️ page through every sticker you selected, so you can check the logo
+     fits correctly across all of them (not just the first one — different base
+     animations can have the logo positioned differently)
+   - +10/+5/-5/-10 buttons or typing a value (e.g. `+8`, `-3`, `75`) resizes the
+     logo across the whole pack and re-renders the current page
+8. Tap **✅ Done** (or type `DONE`) when it looks right
+9. Choose the output type: **🙂 Custom Emoji Pack** or **🎨 Sticker Pack** — the bot
+   then builds the full pack across every selected base animation and gives you the
+   `t.me/addemoji/...` or `t.me/addstickers/...` link when finished
 
 ## Project structure
 
