@@ -32,7 +32,7 @@ format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("8872778735:AAE8C1KkGrVDzxjEcJr3FXb-GcmNY0rcTIs", "8651176548:AAF0nHOk0HYSFcvkgToocRfVviPIRsaSXzE")
+BOT_TOKEN = os.getenv("8872778735:AAE8C1KkGrVDzxjEcJr3FXb-GcmNY0rcTIs", "8872778735:AAEDk-M5fLsBVw7z-xPslaDyqe9HBoZHuzI")
 
 LOTTIES_DIR = Path("lotties")
 
