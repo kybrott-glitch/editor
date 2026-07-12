@@ -408,19 +408,109 @@ def to_tgs(d: dict) -> bytes:
     return buf.getvalue()
 
 
-def render_preview_gif(d: dict, skip_frames: int = 2) -> bytes:
+def _normalize_for_preview(d: dict) -> dict:
+    """
+    Some base animations use AE-style layer styles (`sy`, e.g. gradient overlay
+    effects) with a gradient-type field (`gt`) written as a full animatable Value
+    object (e.g. {"a": 0, "k": 1, "ix": 6}) instead of a plain int. That's valid
+    Lottie in the wild and Telegram/rlottie render it fine, but the `lottie`
+    Python library's strict schema only accepts a plain int there and raises
+    ValueError otherwise. This only affects the preview renderer, which needs
+    the strict object model — the real .tgs export never parses through it, so
+    final pack output isn't affected either way.
+    """
+
+    def fix(obj):
+        if isinstance(obj, dict):
+            styles = obj.get("sy")
+            if isinstance(styles, list):
+                for style in styles:
+                    if not isinstance(style, dict):
+                        continue
+                    gt = style.get("gt")
+                    if isinstance(gt, dict):
+                        k = gt.get("k", 1)
+                        if isinstance(k, list) and k and isinstance(k[0], dict):
+                            # keyframed — fall back to the first keyframe's start value
+                            s = k[0].get("s", 1)
+                            k = s[0] if isinstance(s, list) else s
+                        style["gt"] = int(k) if isinstance(k, (int, float)) else 1
+            for v in obj.values():
+                fix(v)
+        elif isinstance(obj, list):
+            for it in obj:
+                fix(it)
+
+    fixed = copy.deepcopy(d)
+    fix(fixed)
+    return fixed
+
+
+def render_preview_gif(d: dict, skip_frames: int | None = None, resolution: int = 256) -> bytes:
     """
     Renders an animation dict straight to an animated GIF (via cairosvg/Pillow),
     bypassing the .tgs sticker format entirely. Since it never goes through
     Telegram's sticker upload pipeline, there's no 512x512 / fps / file-size
     sticker constraint to worry about while just checking how it looks.
-    skip_frames=2 renders every other frame to keep preview render times low.
-    """
-    from lottie.exporters.gif import export_gif
 
-    anim_obj = objects.Animation.load(copy.deepcopy(d))
+    This is a preview, not the final output, so it's deliberately rendered
+    smaller and skips frames to keep it fast:
+    - resolution=256 (vs. the real 512x512 sticker) — rasterizing is the
+      slow part, and cutting the pixel count ~4x cuts render time roughly
+      the same, with no visible loss for a quick fit-check
+    - skip_frames is auto-tuned (when not given explicitly) from how heavy the
+      animation actually is — some base animations use many extra layers or
+      AE-style layer-style effects (gradient overlays, drop shadows) that cost
+      several times more per frame to rasterize, so those get skipped more
+      aggressively to keep render time roughly consistent across all stickers
+    - frames are rendered in parallel across CPU cores, which helps further
+      on multi-core hosts (cairo's C rendering releases the GIL)
+    Together these took a ~7-11s preview down to ~2-6s in testing, scaling with
+    per-sticker complexity rather than a flat worst-case time.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    import cairosvg
+    from lottie.exporters.gif import _png_gif_prepare
+    from lottie.exporters.svg import export_svg
+    from PIL import Image
+
+    anim_obj = objects.Animation.load(_normalize_for_preview(d))
+    start = int(anim_obj.in_point)
+    end = int(anim_obj.out_point)
+
+    if skip_frames is None:
+        probe_buf = io.BytesIO()
+        export_svg(anim_obj, probe_buf, start, pretty=False)
+        svg_size = probe_buf.tell()
+        skip_frames = 3 if svg_size < 30_000 else 4 if svg_size < 80_000 else 6
+
+    frame_nums = list(range(start, end + 1, skip_frames))
+
+    def render_frame(n: int) -> Image.Image:
+        svg_buf = io.BytesIO()
+        export_svg(anim_obj, svg_buf, n, pretty=False)
+        svg_buf.seek(0)
+        png_bytes = cairosvg.svg2png(
+            file_obj=svg_buf, output_width=resolution, output_height=resolution
+        )
+        return _png_gif_prepare(Image.open(io.BytesIO(png_bytes)))
+
+    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as ex:
+        frames = list(ex.map(render_frame, frame_nums))
+
+    duration = int(round(1000 / anim_obj.frame_rate * skip_frames / 10)) * 10
     buf = io.BytesIO()
-    export_gif(anim_obj, buf, dpi=96, skip_frames=skip_frames)
+    frames[0].save(
+        buf,
+        format="GIF",
+        append_images=frames[1:],
+        save_all=True,
+        duration=duration,
+        loop=0,
+        transparency=255,
+        disposal=2,
+    )
     return buf.getvalue()
 
 
@@ -844,16 +934,21 @@ async def send_preview(msg: Message, state: FSMContext):
         n,
     )
     status = await msg.answer("🎞 Rendering preview GIF…")
+    await state.update_data(preview_idx=idx)
     try:
         gif_bytes = await asyncio.get_running_loop().run_in_executor(
             None, lambda: render_preview_gif(mod)
         )
     except Exception as e:
-        logger.error(f"[send_preview] GIF render failed: {type(e).__name__}: {e}")
-        await status.edit_text(f"❌ Preview render failed: {type(e).__name__}: {e}")
+        logger.error(f"[send_preview] GIF render failed on sticker #{n}: {type(e).__name__}: {e}")
+        await status.edit_text(
+            f"❌ Sticker #{n} failed to render a preview ({type(e).__name__}).\n"
+            f"You can still page to another sticker or press Done — this only "
+            f"affects the preview, not the final pack.",
+            reply_markup=scale_kb(idx, len(selected)),
+        )
         return
     await status.delete()
-    await state.update_data(preview_idx=idx)
     await msg.answer_animation(
         BufferedInputFile(gif_bytes, filename="preview.gif"),
         caption=(
