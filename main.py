@@ -398,10 +398,37 @@ def protect_json(d: dict) -> dict:
     return d
 
 
+def strip_layer_styles(d: dict) -> dict:
+    """
+    Removes the `sy` (AE-style Layer Styles, e.g. gradient overlay / drop shadow
+    effects) property from every layer. Telegram's own technical requirements
+    (core.telegram.org/animated_stickers#animation-requirements) explicitly
+    disallow "Layer Effects" in .tgs files. In practice the real validator
+    tolerates a small amount of this before rejecting the file outright with a
+    generic "wrong file type" / "File type is invalid" error once a base
+    animation has enough of them — some of the base stickers use this AE
+    feature fairly heavily, so it's stripped here unconditionally rather than
+    hoping any given file stays under whatever the undocumented threshold is.
+    """
+
+    def strip(obj):
+        if isinstance(obj, dict):
+            obj.pop("sy", None)
+            for v in obj.values():
+                strip(v)
+        elif isinstance(obj, list):
+            for it in obj:
+                strip(it)
+
+    strip(d)
+    return d
+
+
 def to_tgs(d: dict) -> bytes:
     buf = io.BytesIO()
     data = copy.deepcopy(d)
     data["tgs"] = 1
+    strip_layer_styles(data)
     protect_json(data)
     with gzip.open(buf, "wb") as gz:
         gz.write(json.dumps(data, separators=(",", ":")).encode())
@@ -410,39 +437,18 @@ def to_tgs(d: dict) -> bytes:
 
 def _normalize_for_preview(d: dict) -> dict:
     """
-    Some base animations use AE-style layer styles (`sy`, e.g. gradient overlay
-    effects) with a gradient-type field (`gt`) written as a full animatable Value
-    object (e.g. {"a": 0, "k": 1, "ix": 6}) instead of a plain int. That's valid
-    Lottie in the wild and Telegram/rlottie render it fine, but the `lottie`
-    Python library's strict schema only accepts a plain int there and raises
-    ValueError otherwise. This only affects the preview renderer, which needs
-    the strict object model — the real .tgs export never parses through it, so
-    final pack output isn't affected either way.
+    strip_layer_styles() now removes `sy` (AE layer styles) from the real .tgs
+    export entirely — Telegram disallows the feature and its validator rejects
+    files that use it too heavily (see strip_layer_styles' docstring). The
+    preview should show exactly what the final sticker will actually look
+    like, so it strips the same thing here rather than trying to render
+    something that won't be in the real output. This also sidesteps a
+    ValueError some of these `sy` entries triggered in the `lottie` library's
+    strict schema loader (a wrapped animatable Value where it expects a plain
+    int), since the whole property is gone either way.
     """
-
-    def fix(obj):
-        if isinstance(obj, dict):
-            styles = obj.get("sy")
-            if isinstance(styles, list):
-                for style in styles:
-                    if not isinstance(style, dict):
-                        continue
-                    gt = style.get("gt")
-                    if isinstance(gt, dict):
-                        k = gt.get("k", 1)
-                        if isinstance(k, list) and k and isinstance(k[0], dict):
-                            # keyframed — fall back to the first keyframe's start value
-                            s = k[0].get("s", 1)
-                            k = s[0] if isinstance(s, list) else s
-                        style["gt"] = int(k) if isinstance(k, (int, float)) else 1
-            for v in obj.values():
-                fix(v)
-        elif isinstance(obj, list):
-            for it in obj:
-                fix(it)
-
     fixed = copy.deepcopy(d)
-    fix(fixed)
+    strip_layer_styles(fixed)
     return fixed
 
 
