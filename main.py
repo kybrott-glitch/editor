@@ -1040,66 +1040,75 @@ async def run_pack(
         return
     created = False
     ok = 0
-    last_error = ""
+    failed = []  # list of (n, filename, error_str)
     for i, (fp, n) in enumerate(files):
-        try:
-            with open(fp, encoding="utf-8") as f:
-                anim = json.load(f)
-            mod = build_anim(
-                anim,
-                d["layers"],
-                d.get("extra", []),
-                d.get("scale", 100.0),
-                d.get("ba_color"),
-                d.get("ff_color"),
-                d.get("logo_c1"),
-                d.get("logo_c2"),
-                n,
-            )
-            sd = {
-                "sticker": BufferedInputFile(to_tgs(mod), filename="s.tgs"),
-                "emoji_list": ["⭐️"],
-                "format": "animated",
-            }
-            if not created:
-                await bot.create_new_sticker_set(
-                    user_id=uid,
-                    name=name,
-                    title=f"Pack {name[:5]}",
-                    stickers=[sd],
-                    sticker_type=sticker_type,
+        for attempt in (1, 2):
+            try:
+                with open(fp, encoding="utf-8") as f:
+                    anim = json.load(f)
+                mod = build_anim(
+                    anim,
+                    d["layers"],
+                    d.get("extra", []),
+                    d.get("scale", 100.0),
+                    d.get("ba_color"),
+                    d.get("ff_color"),
+                    d.get("logo_c1"),
+                    d.get("logo_c2"),
+                    n,
                 )
-                created = True
-            else:
-                await bot.add_sticker_to_set(user_id=uid, name=name, sticker=sd)
-            ok += 1
-            if ok % 10 == 0:
-                await stat.edit_text(f"⚙️ {ok}/{len(files)} ✅")
-        except Exception as e:
-            tb = traceback.format_exc()
-            last_error = f"File {fp.name}: {type(e).__name__}: {e}"
-            logger.error(f"[run_pack] {last_error}\n{tb}")
-            # Send first error to chat so you can see it immediately
-            if not created and i == 0:
-                short = (last_error[:300] + "…") if len(last_error) > 300 else last_error
-                await stat.edit_text(
-                    f"❌ Failed on first sticker:\n<code>{short}</code>", parse_mode="HTML"
+                sd = {
+                    "sticker": BufferedInputFile(to_tgs(mod), filename="s.tgs"),
+                    "emoji_list": ["⭐️"],
+                    "format": "animated",
+                }
+                if not created:
+                    await bot.create_new_sticker_set(
+                        user_id=uid,
+                        name=name,
+                        title=f"Pack {name[:5]}",
+                        stickers=[sd],
+                        sticker_type=sticker_type,
+                    )
+                    created = True
+                else:
+                    await bot.add_sticker_to_set(user_id=uid, name=name, sticker=sd)
+                ok += 1
+                if ok % 10 == 0:
+                    await stat.edit_text(f"⚙️ {ok}/{len(files)} ✅")
+                break  # success — don't retry
+            except Exception as e:
+                err_str = f"{type(e).__name__}: {e}"
+                if attempt == 1:
+                    # one quick retry — covers transient network hiccups; a real
+                    # content problem (e.g. wrong file type) will just fail again fast
+                    await asyncio.sleep(1)
+                    continue
+                logger.error(
+                    f"[run_pack] File {fp.name} (#{n}): {err_str}\n{traceback.format_exc()}"
                 )
-                return
+                failed.append((n, fp.name, err_str))
     link_path = "addemoji" if sticker_type == "custom_emoji" else "addstickers"
     kind_label = "custom emoji" if sticker_type == "custom_emoji" else "stickers"
     if created:
-        await stat.edit_text(
-            f"✅ Done! ({ok}/{len(files)} {kind_label})\n"
-            f"🔗 <a href='https://t.me/{link_path}/{name}'>t.me/{link_path}/{name}</a>"
-            + (f"\n⚠️ {len(files)-ok} failed — check logs" if ok < len(files) else ""),
-            parse_mode="HTML",
-        )
+        msg_lines = [
+            f"✅ Done! ({ok}/{len(files)} {kind_label})",
+            f"🔗 <a href='https://t.me/{link_path}/{name}'>t.me/{link_path}/{name}</a>",
+        ]
+        if failed:
+            msg_lines.append(f"\n⚠️ {len(failed)} sticker(s) failed and were skipped:")
+            for n, fname, err in failed[:15]:
+                short_err = err if len(err) <= 80 else err[:80] + "…"
+                msg_lines.append(f"  • #{n} ({fname}): <code>{short_err}</code>")
+            if len(failed) > 15:
+                msg_lines.append(f"  …and {len(failed) - 15} more (see bot logs)")
+        await stat.edit_text("\n".join(msg_lines), parse_mode="HTML", disable_web_page_preview=True)
     else:
-        short = (last_error[:400] + "…") if len(last_error) > 400 else last_error
-        await stat.edit_text(
-            f"❌ Error — nothing was created.\n<code>{short}</code>", parse_mode="HTML"
-        )
+        lines = ["❌ Every sticker failed — nothing was created.", ""]
+        for n, fname, err in failed[:10]:
+            short_err = err if len(err) <= 150 else err[:150] + "…"
+            lines.append(f"• #{n} ({fname}): <code>{short_err}</code>")
+        await stat.edit_text("\n".join(lines), parse_mode="HTML")
 
 
 async def main():
